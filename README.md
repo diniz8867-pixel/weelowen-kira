@@ -3146,85 +3146,203 @@ local function isPackAnim(id)
 end
 
 local function saveOriginalAnims(char)
-    local animate = char:FindFirstChild("Animate")
+    local animate = char and char:FindFirstChild("Animate")
     if not animate then return end
     local function g(obj) return obj and obj.AnimationId or nil end
     local ids = {
-        idle1 = g(animate.idle and animate.idle.Animation1),
-        idle2 = g(animate.idle and animate.idle.Animation2),
-        walk  = g(animate.walk and animate.walk.WalkAnim),
-        run   = g(animate.run  and animate.run.RunAnim),
-        jump  = g(animate.jump and animate.jump.JumpAnim),
-        fall  = g(animate.fall and animate.fall.FallAnim),
-        climb = g(animate.climb and animate.climb.ClimbAnim),
-        swim  = g(animate.swim and animate.swim.Swim),
-        swimidle = g(animate.swimidle and animate.swimidle.SwimIdle),
+        idle1 = g(animate.idle and animate.idle:FindFirstChild("Animation1")),
+        idle2 = g(animate.idle and animate.idle:FindFirstChild("Animation2")),
+        walk = g(animate.walk and animate.walk:FindFirstChild("WalkAnim")),
+        run = g(animate.run and animate.run:FindFirstChild("RunAnim")),
+        jump = g(animate.jump and animate.jump:FindFirstChild("JumpAnim")),
+        fall = g(animate.fall and animate.fall:FindFirstChild("FallAnim")),
+        climb = g(animate.climb and animate.climb:FindFirstChild("ClimbAnim")),
+        swim = g(animate.swim and animate.swim:FindFirstChild("Swim")),
+        swimidle = g(animate.swimidle and animate.swimidle:FindFirstChild("SwimIdle")),
     }
-    if not isPackAnim(ids.walk) then originalTryardAnims = ids end
+    if ids.walk and not isPackAnim(ids.walk) then originalTryardAnims = ids end
+end
+
+-- Anim Pack playback is driven directly through Animator tracks instead of
+-- only changing Animate.AnimationId values (which may leave cached tracks active).
+local animPackTracks = {}
+local animPackConnections = {}
+local animPackCharacter = nil
+local animPackAnimateWasDisabled = nil
+local animPackCurrentTrack = nil
+
+local function disconnectAnimPackConnections()
+    for _, conn in ipairs(animPackConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(animPackConnections)
+end
+
+local function stopDirectAnimTracks()
+    disconnectAnimPackConnections()
+    for _, track in pairs(animPackTracks) do
+        pcall(function() track:Stop(0.15) end)
+        pcall(function() track:Destroy() end)
+    end
+    table.clear(animPackTracks)
+    animPackCurrentTrack = nil
+end
+
+local function restoreAnimateScript(char)
+    local animate = char and char:FindFirstChild("Animate")
+    if animate and animPackAnimateWasDisabled ~= nil then
+        pcall(function() animate.Disabled = animPackAnimateWasDisabled end)
+    end
+    animPackAnimateWasDisabled = nil
+end
+
+local function playDirectAnim(name)
+    local track = animPackTracks[name]
+    if not track or animPackCurrentTrack == name then return end
+    if animPackCurrentTrack and animPackTracks[animPackCurrentTrack] then
+        pcall(function() animPackTracks[animPackCurrentTrack]:Stop(0.12) end)
+    end
+    animPackCurrentTrack = name
+    pcall(function()
+        track:Play(0.12, 1, 1)
+    end)
+end
+
+local function startDirectAnimPack(char, packName)
+    local pack = ANIM_PACKS[packName]
+    if not char or not pack then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = hum
+    end
+
+    stopDirectAnimTracks()
+    animPackCharacter = char
+
+    local animate = char:FindFirstChild("Animate")
+    if animate and animate:IsA("LocalScript") then
+        if animPackAnimateWasDisabled == nil then
+            animPackAnimateWasDisabled = animate.Disabled
+        end
+        pcall(function() animate.Disabled = true end)
+    end
+
+    local function makeTrack(name, id, priority, looped)
+        if not id then return end
+        local animation = Instance.new("Animation")
+        animation.Name = "KiraVS_AnimPack_" .. name
+        animation.AnimationId = id
+        local ok, track = pcall(function() return animator:LoadAnimation(animation) end)
+        if ok and track then
+            track.Priority = priority
+            track.Looped = looped
+            animPackTracks[name] = track
+        end
+        -- Keep Animation instances parented to the character for the life of the track.
+        animation.Parent = char
+    end
+
+    makeTrack("Idle", pack.idle1, Enum.AnimationPriority.Idle, true)
+    makeTrack("Walk", pack.walk, Enum.AnimationPriority.Movement, true)
+    makeTrack("Run", pack.run or pack.walk, Enum.AnimationPriority.Movement, true)
+    makeTrack("Jump", pack.jump, Enum.AnimationPriority.Action, false)
+    makeTrack("Fall", pack.fall, Enum.AnimationPriority.Movement, true)
+    makeTrack("Climb", pack.climb, Enum.AnimationPriority.Movement, true)
+    makeTrack("Swim", pack.swim, Enum.AnimationPriority.Movement, true)
+    makeTrack("SwimIdle", pack.swimidle, Enum.AnimationPriority.Movement, true)
+
+    table.insert(animPackConnections, hum.Running:Connect(function(speed)
+        if currentAnimPack ~= packName or LP.Character ~= char then return end
+        if hum:GetState() == Enum.HumanoidStateType.Running and speed > 1 then
+            playDirectAnim(speed > 14 and "Run" or "Walk")
+        elseif hum:GetState() == Enum.HumanoidStateType.Running or hum:GetState() == Enum.HumanoidStateType.RunningNoPhysics then
+            playDirectAnim("Idle")
+        end
+    end))
+
+    table.insert(animPackConnections, hum.StateChanged:Connect(function(_, state)
+        if currentAnimPack ~= packName or LP.Character ~= char then return end
+        if state == Enum.HumanoidStateType.Jumping then
+            playDirectAnim("Jump")
+        elseif state == Enum.HumanoidStateType.Freefall then
+            playDirectAnim("Fall")
+        elseif state == Enum.HumanoidStateType.Climbing then
+            playDirectAnim("Climb")
+        elseif state == Enum.HumanoidStateType.Swimming then
+            playDirectAnim(hum.MoveDirection.Magnitude > 0.05 and "Swim" or "SwimIdle")
+        elseif state == Enum.HumanoidStateType.Running or state == Enum.HumanoidStateType.RunningNoPhysics then
+            if hum.MoveDirection.Magnitude > 0.05 then
+                playDirectAnim(hum.WalkSpeed > 14 and "Run" or "Walk")
+            else
+                playDirectAnim("Idle")
+            end
+        end
+    end))
+
+    playDirectAnim("Idle")
 end
 
 local function applyAnimPack(packName)
     currentAnimPack = packName
-    if animSelectorLabel then animSelectorLabel.Text = packName end
+    if animSelectorLabel and animSelectorLabel.Parent then
+        animSelectorLabel.Text = packName
+    end
+
+    local char = LP.Character
+    if not char then return end
+
     if packName == "Off" then
-        if originalTryardAnims and LP.Character then
-            local animate = LP.Character:FindFirstChild("Animate")
+        stopDirectAnimTracks()
+        local wasAnimateDisabled = animPackAnimateWasDisabled
+        restoreAnimateScript(char)
+        if tryardHeartbeatConn then
+            tryardHeartbeatConn:Disconnect()
+            tryardHeartbeatConn = nil
+        end
+        if originalTryardAnims then
+            local animate = char:FindFirstChild("Animate")
             if animate then
-                local function s(obj,id) if obj then obj.AnimationId = id end end
-                s(animate.idle and animate.idle.Animation1, originalTryardAnims.idle1)
-                s(animate.idle and animate.idle.Animation2, originalTryardAnims.idle2)
-                s(animate.walk and animate.walk.WalkAnim, originalTryardAnims.walk)
-                s(animate.run  and animate.run.RunAnim,   originalTryardAnims.run)
-                s(animate.jump and animate.jump.JumpAnim, originalTryardAnims.jump)
-                s(animate.fall and animate.fall.FallAnim, originalTryardAnims.fall)
-                s(animate.climb and animate.climb.ClimbAnim, originalTryardAnims.climb)
-                s(animate.swim and animate.swim.Swim, originalTryardAnims.swim)
-                s(animate.swimidle and animate.swimidle.SwimIdle, originalTryardAnims.swimidle)
+                local function set(obj, id)
+                    if obj and id then pcall(function() obj.AnimationId = id end) end
+                end
+                set(animate.idle and animate.idle:FindFirstChild("Animation1"), originalTryardAnims.idle1)
+                set(animate.idle and animate.idle:FindFirstChild("Animation2"), originalTryardAnims.idle2)
+                set(animate.walk and animate.walk:FindFirstChild("WalkAnim"), originalTryardAnims.walk)
+                set(animate.run and animate.run:FindFirstChild("RunAnim"), originalTryardAnims.run)
+                set(animate.jump and animate.jump:FindFirstChild("JumpAnim"), originalTryardAnims.jump)
+                set(animate.fall and animate.fall:FindFirstChild("FallAnim"), originalTryardAnims.fall)
+                set(animate.climb and animate.climb:FindFirstChild("ClimbAnim"), originalTryardAnims.climb)
+                set(animate.swim and animate.swim:FindFirstChild("Swim"), originalTryardAnims.swim)
+                set(animate.swimidle and animate.swimidle:FindFirstChild("SwimIdle"), originalTryardAnims.swimidle)
+            end
+            if animate and animate:IsA("LocalScript") then
+                pcall(function()
+                    animate.Disabled = true
+                    task.wait(0.05)
+                    animate.Disabled = wasAnimateDisabled == true
+                end)
             end
         end
-        if tryardHeartbeatConn then tryardHeartbeatConn:Disconnect(); tryardHeartbeatConn = nil end
+        animPackCharacter = nil
         return
     end
-    local pack = ANIM_PACKS[packName]
-    if not pack then return end
-    if tryardHeartbeatConn then tryardHeartbeatConn:Disconnect() end
-    tryardHeartbeatConn = RunService.Heartbeat:Connect(function()
-        local c = LP.Character
-        if not c then return end
-        local animate = c:FindFirstChild("Animate")
-        if not animate then return end
-        local function s(obj,id) if obj then obj.AnimationId = id end end
-        s(animate.idle and animate.idle.Animation1, pack.idle1)
-        s(animate.idle and animate.idle.Animation2, pack.idle2)
-        s(animate.walk and animate.walk.WalkAnim, pack.walk)
-        s(animate.run  and animate.run.RunAnim,   pack.run)
-        s(animate.jump and animate.jump.JumpAnim, pack.jump)
-        s(animate.fall and animate.fall.FallAnim, pack.fall)
-        s(animate.climb and animate.climb.ClimbAnim, pack.climb)
-        s(animate.swim and animate.swim.Swim, pack.swim)
-        s(animate.swimidle and animate.swimidle.SwimIdle, pack.swimidle)
-    end)
+
+    if not ANIM_PACKS[packName] then return end
+    startDirectAnimPack(char, packName)
 end
 
 local function startAnimPack(packName)
     local char = LP.Character
-    if char then
+    if char and packName ~= "Off" then
         saveOriginalAnims(char)
-        applyAnimPack(packName)
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then
-            for _, track in ipairs(hum:GetPlayingAnimationTracks()) do track:Stop(0) end
-            hum:ChangeState(Enum.HumanoidStateType.Running)
-        end
-    else
-        applyAnimPack(packName)
     end
-    currentAnimPack = packName
+    applyAnimPack(packName)
 end
 
 local function stopAnimPack()
-    currentAnimPack = "Off"
-    if animSelectorLabel then animSelectorLabel.Text = "Off" end
     applyAnimPack("Off")
 end
 
